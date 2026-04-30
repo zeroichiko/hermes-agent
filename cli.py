@@ -8624,6 +8624,53 @@ class HermesCLI:
             except Exception:
                 pass
 
+    def _supervise_completion(self, original_task: str, trajectory: list, final_response: str) -> str:
+        """Use LLM to judge if task is complete or needs continuation."""
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        sup_cfg = cfg.get("supervisor", {})
+
+        if not sup_cfg.get("enabled", False):
+            return "[任務完成]"
+
+        window_size = sup_cfg.get("trajectory_window", 10)
+        template = sup_cfg.get("prompt_template", self._DEFAULT_SUPERVISOR_PROMPT)
+        sup_model = sup_cfg.get("model") or self.model
+
+        traj_text = "\n".join(trajectory[-window_size:]) if trajectory else "(no history)"
+        prompt = template.format(task=original_task, trajectory=traj_text, response=final_response, window_size=window_size)
+
+        try:
+            from openai import OpenAI
+            client = OpenAI(base_url=self.base_url or "", api_key=self.api_key or "nokey")
+            resp = client.chat.completions.create(
+                model=sup_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=50
+            )
+            decision = resp.choices[0].message.content.strip()
+            match = re.search(r"\[(任務完成 | 等待回答 | 繼續任務)\]", decision)
+            if match:
+                return match.group(0)
+            if "[任務完成]" in decision: return "[任務完成]"
+            if "[等待回答]" in decision: return "[等待回答]"
+            return "[繼續任務]"
+        except Exception as e:
+            logging.warning(f"Supervisor LLM call failed: {e}")
+            return "[任務完成]"
+
+    _DEFAULT_SUPERVISOR_PROMPT = """Original Task: {task}
+
+Agent Trajectory (last {window_size} exchanges):
+{trajectory}
+
+Final Response: {response}
+
+Judge if task is complete. Respond ONLY with one of these tags:
+[任務完成] - Task fully completed, can return to user
+[等待回答] - Waiting for human input/confirmation required  
+[繼續任務] - Continue execution automatically"""
+
     def chat(self, message, images: list = None) -> Optional[str]:
         """
         Send a message to the agent and get a response.
@@ -9195,7 +9242,120 @@ class HermesCLI:
                 print(f"\n⏩ Delivering leftover /steer as next turn: '{preview}'")
                 self._pending_input.put(_leftover_steer)
 
+            # ═══════════════════════════════════════════════════════════
+            # SUPERVISOR LOOP: Auto-continuation when [繼續任務] returned
+            # ═══════════════════════════════════════════════════════════
+            from hermes_cli.config import load_config
+            sup_cfg = load_config().get("supervisor", {})
+            if sup_cfg.get("enabled", False) and result and response:
+
+                # Get iteration counter (track consecutive auto-continuations)
+                max_iters = sup_cfg.get("max_auto_iterations", 50)
+
+                # Check if clarify is active - must yield immediately for safety
+                clarify_active = getattr(self, '_clarify_state', False) or getattr(self, '_clarify_freetext', False)
+
+                if not clarify_active:
+                    # Wrap in while loop to support continue on [繼續任務]
+                    _supervisor_iteration_count = 0
+                    _last_response = None
+                    while True:
+                        # Build trajectory from conversation history (last N exchanges)
+                        window = sup_cfg.get("trajectory_window", 10)
+                        traj = []
+                        for msg in self.conversation_history[-(window*2):]:
+                            role = msg.get("role", "")
+                            content = msg.get("content", "") or ""
+                            if isinstance(content, list):
+                                content = " ".join(str(c) for c in content if isinstance(c, str))
+                            traj.append(f"{role.upper()}: {content[:500]}")
+
+                        # Call supervisor LLM to judge completion
+                        sup_decision = self._supervise_completion(message, traj, response)
+
+                        _cprint(chr(10) + f"{_DIM}┌─ Supervisor Decision: {sup_decision} ───────────────┐{_RST}")
+                        logging.info(f"[Supervisor] Decision for task '{message[:50]}': {sup_decision}")
+
+                        if sup_decision == "[繼續任務]":
+                            # Check iteration limit
+                            if _supervisor_iteration_count >= max_iters:
+                                _cprint(f"{_DIM}│ ⚠ Auto-iteration limit ({max_iters}) reached. Stopping.{_RST}")
+                                break
+                            else:
+                                # Add current response to history and retry
+                                self.conversation_history.append({"role": "assistant", "content": response})
+                                _supervisor_iteration_count += 1
+
+                                _cprint(f"{_DIM}│ ↻ Auto-continuation ({_supervisor_iteration_count}/{max_iters})...{_RST}")
+                                logging.info(f"[Supervisor] Iteration {_supervisor_iteration_count}: Continuing task")
+
+                                # Re-run agent with same message (agent sees full history including last response)
+                                retry_result = None
+                                def run_retry():
+                                    nonlocal retry_result
+                                    try:
+                                        retry_result = self.agent.run_conversation(
+                                            user_message=message,  # Same original message
+                                            conversation_history=self.conversation_history[:-1],  # Exclude last assistant msg to avoid duplicate
+                                            stream_callback=stream_callback,
+                                            task_id=self.session_id,
+                                            persist_user_message=None,  # Already in history
+                                        )
+                                    except Exception as exc:
+                                        logging.error(f"Retry failed: {exc}")
+
+                                retry_thread = threading.Thread(target=run_retry)
+                                retry_thread.start()
+                                while retry_thread.is_alive():
+                                    if hasattr(self, '_interrupt_queue'):
+                                        try:
+                                            int_msg = self._interrupt_queue.get(timeout=0.1)
+                                            if int_msg and not clarify_active:
+                                                print(chr(10) + "⚡ Interrupt during auto-continuation...")
+                                                pending_message = int_msg
+                                                break
+                                        except queue.Empty:
+                                            pass
+
+                                if retry_result and retry_result.get("final_response"):
+                                    _new_response = retry_result["final_response"]
+                                    # Duplicate response detection: compare with previous response
+                                    _prev_response = _last_response
+                                    _last_response_changed = False
+                                    if _prev_response is not None:
+                                        _prev_prefix = _prev_response[:200]
+                                        _new_prefix = _new_response[:200]
+                                        if _prev_prefix and _new_prefix and _prev_prefix != _new_prefix:
+                                            _last_response_changed = True
+
+                                    if not _last_response_changed and _prev_response is not None:
+                                        # Response is the same or too similar - break to prevent infinite loop
+                                        _cprint(f"{_DIM}| Response unchanged after retry. Breaking loop.{_RST}")
+                                        logging.info("[Supervisor] Duplicate response detected. Breaking infinite loop.")
+                                        response = _new_response
+                                        result = retry_result
+                                        _last_response = _new_response
+                                        break
+
+                                    response = _new_response
+                                    result = retry_result
+                                    _last_response = _new_response
+                                    _cprint(f"{_DIM}| Retry completed. Re-evaluating...{_RST}")
+                                    continue  # Loop back to re-check supervisor decision
+                                else:
+                                    _cprint(f"{_DIM}│ ⚠ Retry returned no response. Stopping.{_RST}")
+                                    break
+
+                        elif sup_decision == "[任務完成]":
+                            _cprint(f"{_DIM}│ ✓ Task judged complete. Returning to user.{_RST}")
+                            break
+                        elif sup_decision == "[等待回答]":
+                            _cprint(f"{_DIM}│ ⏸ Waiting for human input required.{_RST}")
+                            break
+
+            
             return response
+
             
         except Exception as e:
             print(f"Error: {e}")
