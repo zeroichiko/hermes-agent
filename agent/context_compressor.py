@@ -25,6 +25,9 @@ import time
 from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import call_llm
+
+# Sentinel value indicating context size probe is not yet available
+_CONTEXT_SIZE_UNPROBED = -1
 from agent.context_engine import ContextEngine
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -344,6 +347,8 @@ class ContextCompressor(ContextEngine):
         self._last_aux_model_failure_model = None
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
+        self._probed_context_size = _CONTEXT_SIZE_UNPROBED
+        self._probe_context_length_at_probing = 0
 
     def update_model(
         self,
@@ -361,6 +366,9 @@ class ContextCompressor(ContextEngine):
         self.provider = provider
         self.api_mode = api_mode
         self.context_length = context_length
+        # Invalidate context probe cache when model/context_length changes
+        self._probed_context_size = _CONTEXT_SIZE_UNPROBED
+        self._probe_context_length_at_probing = 0
         self.threshold_tokens = max(
             int(context_length * self.threshold_percent),
             MINIMUM_CONTEXT_LENGTH,
@@ -462,8 +470,105 @@ class ContextCompressor(ContextEngine):
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
         self.last_completion_tokens = usage.get("completion_tokens", 0)
 
+    def _probe_context_size(self) -> int:
+        """Probe the LLM server for its actual context size.
+
+        Makes a minimal API call (tiny prompt, max_tokens=1) to discover
+        the real context limit enforced by the server. This is necessary
+        because the stored self.context_length may be stale or incorrect
+        (e.g. the server may have downgraded the model's context window).
+
+        Uses a direct httpx call (NOT call_llm) so the probe call
+        does NOT include the conversation history — critical because the
+        conversation may already be too large for any API call to succeed.
+
+        Caches the result and reuses it as long as self.context_length
+        hasn't changed (i.e. no model switch occurred).
+
+        Returns the actual context size in tokens, or self.context_length
+        if probing fails.
+        """
+        if not self.base_url or not self.api_key:
+            logger.debug("Cannot probe context size: missing base_url or api_key")
+            return self.context_length
+
+        # Reuse cached result if context_length hasn't changed
+        if (hasattr(self, '_probed_context_size')
+                and self._probed_context_size > 0
+                and getattr(self, '_probe_context_length_at_probing', 0) == self.context_length):
+            return self._probed_context_size
+
+        import httpx
+        probe_tiers = [256_000, 128_000, 64_000, 32_000, 16_000, 8_000]
+
+        for tier in probe_tiers:
+            try:
+                # Direct API call — tiny prompt, NO conversation history.
+                # This is the key difference from call_llm: the probe call
+                # is completely independent of the conversation context,
+                # so it will succeed even when the conversation is too large.
+                url = f"{self.base_url.rstrip('/')}/v1/chat/completions"
+                headers = {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                }
+                body = {
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": "ok"}],
+                    "max_tokens": 1,
+                    "temperature": 0.0,
+                }
+                with httpx.Client(timeout=5.0) as client:
+                    resp = client.post(url, headers=headers, json=body)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        # Success — server accepted our tiny context.
+                        # The actual context size is at least as large as tier.
+                        actual_size = max(tier, 8_000)
+                        logger.info(
+                            "Context probe succeeded with tier=%d (actual >= %d)",
+                            tier, actual_size,
+                        )
+                        self._probed_context_size = actual_size
+                        self._probe_context_length_at_probing = self.context_length
+                        return actual_size
+                    err_text = resp.text.lower()
+                    if "context" in err_text and ("exceed" in err_text or "limit" in err_text or "size" in err_text or "length" in err_text):
+                        # Server rejected — context size is smaller than tier.
+                        logger.info(
+                            "Context probe rejected at tier=%d (HTTP %d) — actual size < %d: %s",
+                            tier, resp.status_code, tier, resp.text[:200],
+                        )
+                        continue
+                    else:
+                        # Other error (auth, network, model not found, etc.)
+                        logger.debug("Context probe failed with non-context error HTTP %d: %s", resp.status_code, err_text[:200])
+                        break
+
+            except Exception as e:
+                err_str = str(e).lower()
+                if "context" in err_str and ("exceed" in err_str or "limit" in err_str or "size" in err_str):
+                    logger.info("Context probe rejected at tier=%d: %s", tier, e)
+                    continue
+                else:
+                    logger.debug("Context probe exception at tier=%d: %s", tier, e)
+                    break
+
+        # All tiers failed or probing errored — fall back to stored context_length
+        logger.warning(
+            "Could not probe actual context size; using stored value %d. "
+            "This may be inaccurate if the server has downgraded the model.",
+            self.context_length,
+        )
+        return self.context_length
+
     def should_compress(self, prompt_tokens: int = None) -> bool:
         """Check if context exceeds the compression threshold.
+
+        When the token count exceeds the threshold, probes the LLM server
+        for its actual context size before deciding to compress. This
+        prevents premature compression when the stored context_length is
+        stale or incorrect.
 
         Includes anti-thrashing protection: if the last two compressions
         each saved less than 10%, skip compression to avoid infinite loops
@@ -482,6 +587,36 @@ class ContextCompressor(ContextEngine):
                     self._ineffective_compression_count,
                 )
             return False
+
+        # Probe the LLM for the actual context size before deciding to compress.
+        # This handles cases where the stored context_length is stale or incorrect
+        # (e.g. the server has downgraded the model's context window).
+        actual_context_size = self._probe_context_size()
+        actual_threshold = int(actual_context_size * self.threshold_percent)
+        if tokens < actual_threshold:
+            if not self.quiet_mode:
+                logger.info(
+                    "Compression deferred — actual context size is %d "
+                    "(threshold=%d), but tokens=%d is below actual threshold.",
+                    actual_context_size, actual_threshold, tokens,
+                )
+            return False
+
+        # Update internal context_length to the probed value so future
+        # calls don't need to re-probe and threshold_tokens stays consistent.
+        if actual_context_size != self.context_length:
+            logger.info(
+                "Context length updated from %d to %d (probed from server). "
+                "Recalculating threshold from %d to %d.",
+                self.context_length, actual_context_size,
+                self.threshold_tokens, actual_threshold,
+            )
+            self.context_length = actual_context_size
+            self.threshold_tokens = max(
+                int(actual_context_size * self.threshold_percent),
+                MINIMUM_CONTEXT_LENGTH,
+            )
+
         return True
 
     # ------------------------------------------------------------------

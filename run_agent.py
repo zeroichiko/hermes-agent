@@ -11038,7 +11038,19 @@ class AIAgent:
                                 provider_name = response.error.metadata.get('provider_name', 'Unknown')
                         elif response and hasattr(response, 'message') and response.message:
                             error_msg = str(response.message)
-                        
+
+                        # ── STRATEGY SWITCH: Detect JSON Parse Error ──
+                        # If the LLM generated a malformed tool call (e.g., missing quotes),
+                        # we must force a strategy change instead of retrying the same command.
+                        if "Failed to parse tool call arguments" in error_msg or "missing closing quote" in error_msg:
+                            self._vprint(f"{self.log_prefix}🚨 CRITICAL: JSON format error detected. Switching to 'Write-Then-Run' strategy.", force=True)
+                            strategy_msg = {
+                                "role": "system",
+                                "content": "CRITICAL ERROR: Previous command failed due to JSON format error (missing closing quote). DO NOT retry the same command. You MUST switch to 'Write-Then-Run' strategy immediately. Use 'write_file' to save the script first, then execute it."
+                            }
+                            messages.insert(0, strategy_msg)
+                            continue
+
                         # Try to get provider from model field (OpenRouter often returns actual model used)
                         if provider_name == "Unknown" and response and hasattr(response, 'model') and response.model:
                             provider_name = f"model={response.model}"

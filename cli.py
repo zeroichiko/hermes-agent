@@ -8639,22 +8639,31 @@ class HermesCLI:
 
         traj_text = "\n".join(trajectory[-window_size:]) if trajectory else "(no history)"
         prompt = template.format(task=original_task, trajectory=traj_text, response=final_response, window_size=window_size)
+        logging.info(f"[Supervisor DEBUG] Prompt (len={len(prompt)}): {prompt}")
 
         try:
             from openai import OpenAI
             client = OpenAI(base_url=self.base_url or "", api_key=self.api_key or "nokey")
+            logging.info(f"[Supervisor DEBUG] Calling model: {sup_model}, max_tokens: 10000")
             resp = client.chat.completions.create(
                 model=sup_model,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=50
+                max_tokens=10000
             )
             decision = resp.choices[0].message.content.strip()
-            match = re.search(r"\[(任務完成 | 等待回答 | 繼續任務)\]", decision)
+            logging.info(f"[Supervisor DEBUG] LLM Output: {decision}")
+            match = re.search(r"\[(任務完成|等待回答|繼續任務)\]", decision)
             if match:
+                logging.info(f"[Supervisor DEBUG] Regex matched: {match.group(0)}")
                 return match.group(0)
-            if "[任務完成]" in decision: return "[任務完成]"
-            if "[等待回答]" in decision: return "[等待回答]"
-            return "[繼續任務]"
+            if "[任務完成]" in decision: 
+                logging.info(f"[Supervisor DEBUG] Fallback: [任務完成] in decision")
+                return "[任務完成]"
+            if "[等待回答]" in decision: 
+                logging.info(f"[Supervisor DEBUG] Fallback: [等待回答] in decision")
+                return "[等待回答]"
+            logging.info(f"[Supervisor DEBUG] No match, defaulting to: [等待回答]")
+            return "[等待回答]"
         except Exception as e:
             logging.warning(f"Supervisor LLM call failed: {e}")
             return "[任務完成]"
