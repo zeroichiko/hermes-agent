@@ -1055,7 +1055,7 @@ WRITE_FILE_SCHEMA = {
 
 PATCH_SCHEMA = {
     "name": "patch",
-    "description": "Targeted find-and-replace edits in files. Use this instead of sed/awk in terminal. Uses fuzzy matching (9 strategies) so minor whitespace/indentation differences won't break it. Returns a unified diff. Auto-runs syntax checks after editing.\n\nReplace mode (default): find a unique string and replace it.\nPatch mode: apply V4A multi-file patches for bulk changes.",
+    "description": "Targeted find-and-replace edits in files. Use this instead of sed/awk in terminal. Uses fuzzy matching (9 strategies) so minor whitespace/indentation differences won't break it. Returns a unified diff. Auto-runs syntax checks after editing.\n\n⚠️ CODE MODIFICATION SAFETY:\n  - ALWAYS read 15 lines around the edit point BEFORE patching. Verify correct block structure (try/except/for/if).\n  - Run git diff after patching. Verify no unintended changes before commit.\n  - Run py_compile on the target file. Not OK locally ≠ OK remotely.\n  - On remote server: compile on the remote machine, not locally.\n  - On error: revert with git diff + git show, don't blindly re-patch.\n  - Label all results: [local] or [50.134]. Never say just \"OK\".\n\nReplace mode (default): find a unique string and replace it.\nPatch mode: apply V4A multi-file patches for bulk changes.",
     "parameters": {
         "type": "object",
         "properties": {

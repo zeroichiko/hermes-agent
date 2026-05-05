@@ -858,6 +858,14 @@ from tools.managed_tool_gateway import is_managed_tool_gateway_ready
 # Tool description for LLM
 TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on a Linux environment. Filesystem usually persists between calls.
 
+⚠️ SAFETY RULES (MANDATORY):
+  - NO multi-line commands in terminal parameter. This causes JSON parse errors.
+  - ALWAYS use write_file first, then execute via terminal (python3 script.py).
+  - For SSH/remote ops: ALWAYS include the host in the command (ssh user@host). NEVER execute on remote without explicit ssh/scp.
+  - After ANY remote change: run py_compile on the target machine, not locally.
+  - After modifying code: run git diff before commit. Verify with compile.
+  - Label all results: [local] or [host]. Never say just "OK".
+
 Do NOT use cat/head/tail to read files — use read_file instead.
 Do NOT use grep/rg/find to search — use search_files instead.
 Do NOT use ls to list directories — use search_files(target='files') instead.
@@ -868,7 +876,7 @@ Reserve terminal for: builds, installs, git, processes, scripts, network, packag
 Foreground (default): Commands return INSTANTLY when done, even if the timeout is high. Set timeout=300 for long builds/scripts — you'll still get the result in seconds if it's fast. Prefer foreground for short commands.
 Background: Set background=true to get a session_id. Two patterns:
   (1) Long-lived processes that never exit (servers, watchers).
-  (2) Long-running tasks with notify_on_complete=true — you can keep working on other things and the system auto-notifies you when the task finishes. Great for test suites, builds, deployments, or anything that takes more than a minute.
+  (2) Long-running tasks with notify_on_complete=true — you can keep working on other things and the system auto-notifies you when the task finishes. Great for test suites, builds, deployments, or anything that takes over a minute.
 For servers/watchers, do NOT use shell-level background wrappers (nohup/disown/setsid/trailing '&') in foreground mode. Use background=true so Hermes can track lifecycle and output.
 After starting a server, verify readiness with a health check or log signal, then run tests in a separate terminal() call. Avoid blind sleep loops.
 Use process(action="poll") for progress checks, process(action="wait") to block until done.
