@@ -11039,18 +11039,6 @@ class AIAgent:
                         elif response and hasattr(response, 'message') and response.message:
                             error_msg = str(response.message)
 
-                        # ── STRATEGY SWITCH: Detect JSON Parse Error ──
-                        # If the LLM generated a malformed tool call (e.g., missing quotes),
-                        # we must force a strategy change instead of retrying the same command.
-                        if "Failed to parse tool call arguments" in error_msg or "missing closing quote" in error_msg:
-                            self._vprint(f"{self.log_prefix}🚨 CRITICAL: JSON format error detected. Switching to 'Write-Then-Run' strategy.", force=True)
-                            strategy_msg = {
-                                "role": "system",
-                                "content": "CRITICAL ERROR: Previous command failed due to JSON format error (missing closing quote). DO NOT retry the same command. You MUST switch to 'Write-Then-Run' strategy immediately. Use 'write_file' to save the script first, then execute it."
-                            }
-                            messages.insert(0, strategy_msg)
-                            continue
-
                         # Try to get provider from model field (OpenRouter often returns actual model used)
                         if provider_name == "Unknown" and response and hasattr(response, 'model') and response.model:
                             provider_name = f"model={response.model}"
@@ -11880,6 +11868,32 @@ class AIAgent:
                     error_type = type(api_error).__name__
                     error_msg = str(api_error).lower()
                     _error_summary = self._summarize_api_error(api_error)
+
+                    # ── JSON Parse Error: Force strategy change ──
+                    # HTTP 500 from "Failed to parse tool call arguments" /
+                    # "missing closing quote" means the LLM generated malformed
+                    # tool call JSON (often from shell heredoc with unescaped
+                    # quotes).  Blind retrying will hit the same error.
+                    # Inject a system directive to switch to Write-Then-Run.
+                    if "Failed to parse tool call arguments" in error_msg or "missing closing quote" in error_msg:
+                        self._vprint(
+                            f"{self.log_prefix}🚨 JSON format error in tool call arguments — "
+                            f"injecting 'Write-Then-Run' strategy directive, retry {retry_count}/{max_retries}",
+                            force=True,
+                        )
+                        strategy_msg = {
+                            "role": "system",
+                            "content": (
+                                "CRITICAL: Your last tool call failed with JSON parse error "
+                                "(missing closing quote). This is caused by unescaped quotes in "
+                                "multi-line shell commands (heredoc). You MUST use the 'Write-Then-Run' strategy: "
+                                "1) Write the full command/script to a file using the 'write_file' tool. "
+                                "2) Execute it via 'terminal' tool with the file path (e.g., 'python3 /tmp/script.py'). "
+                                "DO NOT put multi-line shell commands directly in tool call arguments."
+                            ),
+                        }
+                        messages.insert(0, strategy_msg)
+                        continue
                     logger.warning(
                         "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
                         retry_count,
