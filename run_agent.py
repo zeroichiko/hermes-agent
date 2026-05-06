@@ -12588,18 +12588,6 @@ class AIAgent:
                 assistant_message = normalized
                 finish_reason = normalized.finish_reason
                 
-                # ── Loop guard: detect stable response repetition ──
-                _reply_text = (assistant_message.content or "").strip()
-                if _reply_text:
-                    try:
-                        self._loop_guard.check(_reply_text)
-                    except AgentLoopDetectedError:
-                        self._vprint(
-                            f"{self.log_prefix}🔁 Loop detected! Switching to backup model.",
-                            force=True,
-                        )
-                        raise  # Re-raise to be caught by caller (gateway)
-
                 # Normalize content to string — some OpenAI-compatible servers
                 # (llama-server, etc.) return content as a dict or list instead
                 # of a plain string, which crashes downstream .strip() calls.
@@ -12621,6 +12609,20 @@ class AIAgent:
                     else:
                         assistant_message.content = str(raw)
 
+                # ── Loop guard: detect stable response repetition ──
+                # Must be AFTER dict/list normalization
+                _reply_text = (assistant_message.content or "").strip()
+                if _reply_text:
+                    try:
+                        self._loop_guard.check(_reply_text)
+                    except AgentLoopDetectedError:
+                        self._vprint(
+                            f"{self.log_prefix}🔁 Loop detected! Switching to backup model.",
+                            force=True,
+                        )
+                        raise  # Re-raise to be caught by caller (gateway)
+
+                # Handle assistant response
                 try:
                     from hermes_cli.plugins import invoke_hook as _invoke_hook
                     _assistant_tool_calls = getattr(assistant_message, "tool_calls", None) or []

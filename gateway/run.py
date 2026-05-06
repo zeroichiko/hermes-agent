@@ -11594,7 +11594,7 @@ class GatewayRunner:
                                 model=_new_model,
                                 max_iterations=agent.max_iterations,
                                 tool_delay=agent.tool_delay,
-                                enabled_toolsets=agent.valid_tool_names if hasattr(agent, 'valid_tool_names') else None,
+                                enabled_toolsets=enabled_toolsets,
                                 disabled_toolsets=agent.disabled_toolsets if hasattr(agent, 'disabled_toolsets') else None,
                                 save_trajectories=agent.save_trajectories,
                                 verbose_logging=agent.verbose_logging,
