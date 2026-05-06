@@ -8641,6 +8641,11 @@ class HermesCLI:
         prompt = template.format(task=original_task, trajectory=traj_text, response=final_response, window_size=window_size)
         logging.info(f"[Supervisor DEBUG] Prompt (len={len(prompt)}): {prompt}")
 
+        # Check interrupt before blocking on LLM call
+        if getattr(getattr(self, 'agent', None), '_interrupt_requested', False):
+            logging.info("[Supervisor] Interrupt requested, skipping LLM call")
+            return "[任務完成]"
+
         try:
             from openai import OpenAI
             client = OpenAI(base_url=self.base_url or "", api_key=self.api_key or "nokey")
@@ -9322,6 +9327,14 @@ Judge if task is complete. Respond ONLY with one of these tags:
                                             if int_msg and not clarify_active:
                                                 print(chr(10) + "⚡ Interrupt during auto-continuation...")
                                                 pending_message = int_msg
+                                                # FIX: Actually interrupt the agent running in retry_thread
+                                                # so it stops instead of continuing in the background.
+                                                if hasattr(self, 'agent') and self.agent is not None:
+                                                    try:
+                                                        self.agent.interrupt(int_msg)
+                                                        logging.info("[Supervisor] Interrupted retry_thread agent")
+                                                    except Exception as _e:
+                                                        logging.warning(f"[Supervisor] Failed to interrupt retry agent: {_e}")
                                                 break
                                         except queue.Empty:
                                             pass
