@@ -4264,6 +4264,15 @@ class GatewayRunner:
                 return None
             logger.debug("PRIORITY interrupt for session %s", _quick_key)
             running_agent.interrupt(event.text)
+            # Clear resume_pending: user sent a new message, so any
+            # prior "interrupted gateway" auto-continue flag is stale.
+            # Without this, the next message triggers auto-continuation
+            # even though the user explicitly interrupted. (#XXXXX)
+            if _quick_key:
+                try:
+                    self.session_store.clear_resume_pending(_quick_key)
+                except Exception:
+                    pass  # non-fatal; resume_pending is advisory
             if _quick_key in self._pending_messages:
                 self._pending_messages[_quick_key] += "\n" + event.text
             else:
@@ -9978,6 +9987,12 @@ class GatewayRunner:
         if adapter and hasattr(adapter, "get_pending_message"):
             adapter.get_pending_message(session_key)  # consume and discard
         self._pending_messages.pop(session_key, None)
+        # Clear resume_pending: an explicit interrupt (stop/reset/user message)
+        # means the user no longer wants auto-continuation.
+        try:
+            self.session_store.clear_resume_pending(session_key)
+        except Exception:
+            pass  # non-fatal
         if release_running_state:
             self._release_running_agent_state(session_key)
 
@@ -10497,7 +10512,7 @@ class GatewayRunner:
                 event_message_id=event_message_id,
             )
 
-        from run_agent import AIAgent
+        from run_agent import AIAgent, AgentLoopDetectedError
         import queue
 
         def _run_still_current() -> bool:
@@ -11505,7 +11520,102 @@ class GatewayRunner:
                 else:
                     _run_message = message
 
-                result = agent.run_conversation(_run_message, conversation_history=agent_history, task_id=session_id)
+                # ── Run conversation with loop-detection rescue ──
+                _loop_rescue_count = 0
+                _max_rescue = 1  # Allow one fallback-model retry
+                while True:
+                    try:
+                        result = agent.run_conversation(
+                            _run_message,
+                            conversation_history=agent_history,
+                            task_id=session_id,
+                        )
+                        break  # Success — exit retry loop
+                    except AgentLoopDetectedError as _loop_exc:
+                        if _loop_rescue_count >= _max_rescue:
+                            # No more rescue attempts — report the error
+                            logger.error(
+                                "Loop detection fired %d times for session %s — giving up: %s",
+                                _loop_rescue_count + 1,
+                                session_id,
+                                _loop_exc,
+                            )
+                            raise
+                        _loop_rescue_count += 1
+                        logger.warning(
+                            "Loop detection triggered (%d/%d). "
+                            "Switching agent model to fallback and retrying…",
+                            _loop_rescue_count,
+                            _max_rescue,
+                        )
+                        # Evict the stale agent so a fresh one picks up the new model
+                        self._evict_cached_agent(session_key or "")
+                        # Determine fallback model
+                        _fb = getattr(self, "_fallback_model", None)
+                        if _fb is not None and isinstance(_fb, dict):
+                            _new_model = _fb.get("model") or _fb.get("name") or ""
+                        elif isinstance(_fb, list) and _fb:
+                            _new_model = _fb[0].get("model", _fb[0].get("name", ""))
+                        elif isinstance(_fb, str):
+                            _new_model = _fb
+                        else:
+                            _new_model = ""
+                        if _new_model:
+                            logger.info("Retrying session %s with model '%s'.", session_id, _new_model)
+                            # Replace this agent with a fresh one using the fallback model
+                            user_config = _load_gateway_config()
+                            _runtime = _resolve_runtime_agent_kwargs()
+                            _fb_cfg = {
+                                "api_key": _new_model,  # placeholder — will be overwritten
+                                "base_url": "",
+                                "provider": "",
+                                "api_mode": "",
+                            }
+                            # Build a minimal fallback config
+                            if isinstance(_fb, dict):
+                                _fb_cfg["provider"] = _fb.get("provider", _runtime.get("provider", ""))
+                                _fb_cfg["base_url"] = _fb.get("base_url", _runtime.get("base_url", ""))
+                                _fb_cfg["api_key"] = _fb.get("api_key", _runtime.get("api_key", ""))
+                            elif isinstance(_fb, list) and _fb:
+                                _fb_cfg["provider"] = _fb[0].get("provider", _runtime.get("provider", ""))
+                                _fb_cfg["base_url"] = _fb[0].get("base_url", _runtime.get("base_url", ""))
+                                _fb_cfg["api_key"] = _fb[0].get("api_key", _runtime.get("api_key", ""))
+                            else:
+                                _fb_cfg["provider"] = _runtime.get("provider", "")
+                                _fb_cfg["base_url"] = _runtime.get("base_url", "")
+                                _fb_cfg["api_key"] = _runtime.get("api_key", "")
+                            # Create a fresh agent with the fallback model
+                            from run_agent import IterationBudget
+                            agent = AIAgent(
+                                base_url=_fb_cfg["base_url"] or _runtime.get("base_url", ""),
+                                api_key=_fb_cfg["api_key"] or _runtime.get("api_key", ""),
+                                provider=_fb_cfg["provider"] or _runtime.get("provider", ""),
+                                api_mode=_fb_cfg["api_mode"] or _runtime.get("api_mode", ""),
+                                model=_new_model,
+                                max_iterations=agent.max_iterations,
+                                tool_delay=agent.tool_delay,
+                                enabled_toolsets=agent.valid_tool_names if hasattr(agent, 'valid_tool_names') else None,
+                                disabled_toolsets=agent.disabled_toolsets if hasattr(agent, 'disabled_toolsets') else None,
+                                save_trajectories=agent.save_trajectories,
+                                verbose_logging=agent.verbose_logging,
+                                quiet_mode=agent.quiet_mode,
+                                ephemeral_system_prompt=agent.ephemeral_system_prompt,
+                            )
+                            # Inject loop context into the user message for the retry
+                            _loop_context = (
+                                "[System note: Your previous turn was interrupted because the model "
+                                "entered a stable response loop (repeated the same output 3 times). "
+                                "A different model is now handling this session. "
+                                "Please review the conversation history and continue working on the task.]"
+                            )
+                            _run_message = _loop_context + "\n\n" + _run_message
+                        else:
+                            logger.error(
+                                "Loop detected but no fallback model configured for session %s. "
+                                "Raising the exception.",
+                                session_id,
+                            )
+                            raise
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)

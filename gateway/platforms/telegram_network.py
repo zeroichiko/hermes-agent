@@ -243,4 +243,15 @@ def _rewrite_request_for_ip(request: httpx.Request, ip: str) -> httpx.Request:
 
 
 def _is_retryable_connect_error(exc: Exception) -> bool:
-    return isinstance(exc, (httpx.ConnectTimeout, httpx.ConnectError))
+    """Return True if the exception is a transient network error that
+    warrants retrying the request against a fallback IP.
+
+    We include ReadTimeout because Telegram's API sometimes takes a very
+    long time to respond on constrained networks -- the request may not
+    have reached the server yet, so retrying is safer than giving up.
+    """
+    return isinstance(exc, (
+        httpx.ConnectTimeout,
+        httpx.ConnectError,
+        httpx.ReadTimeout,
+    ))

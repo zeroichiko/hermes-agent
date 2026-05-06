@@ -268,6 +268,19 @@ class IterationBudget:
     ``execute_code`` (programmatic tool calling) iterations are refunded via
     :meth:`refund` so they don't eat into the budget.
     """
+    """Thread-safe iteration counter for an agent.
+
+    Each agent (parent or subagent) gets its own ``IterationBudget``.
+    The parent's budget is capped at ``max_iterations`` (default 90).
+    Each subagent gets an independent budget capped at
+    ``delegation.max_iterations`` (default 50) — this means total
+    iterations across parent + subagents can exceed the parent's cap.
+    Users control the per-subagent limit via ``delegation.max_iterations``
+    in config.yaml.
+
+    ``execute_code`` (programmatic tool calling) iterations are refunded via
+    :meth:`refund` so they don't eat into the budget.
+    """
 
     def __init__(self, max_total: int):
         self.max_total = max_total
@@ -298,7 +311,36 @@ class IterationBudget:
             return max(0, self.max_total - self._used)
 
 
-# Tools that must never run concurrently (interactive / user-facing).
+class AgentLoopDetectedError(Exception):
+    """Raised when the agent is detected to be in a repeating response loop."""
+    pass
+
+
+class LoopGuard:
+    def __init__(self, threshold: float = 0.9):
+        self._history: list[str] = []
+        self._threshold = threshold
+
+    def check(self, content: str) -> None:
+        """Check if the current content is highly similar to the last 2 contents."""
+        if not content:
+            return
+
+        # Clean content for comparison
+        cleaned = " ".join(content.lower().split())
+        
+        if len(self._history) >= 2:
+            import difflib
+            # Check similarity with the last two responses
+            match_last = difflib.SequenceMatcher(None, cleaned, self._history[-1]).ratio()
+            match_prev = difflib.SequenceMatcher(None, cleaned, self._history[-2]).ratio()
+            
+            if match_last >= self._threshold and match_prev >= self._threshold:
+                raise AgentLoopDetectedError("Detected stable response loop (3 consecutive similar outputs).")
+
+        self._history.append(cleaned)
+        if len(self._history) > 3:
+            self._history.pop(0)
 # When any of these appear in a batch, we fall back to sequential execution.
 _NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
 
@@ -995,6 +1037,7 @@ class AIAgent:
         # Shared iteration budget — parent creates, children inherit.
         # Consumed by every LLM turn across parent + all subagents.
         self.iteration_budget = iteration_budget or IterationBudget(max_iterations)
+        self._loop_guard = LoopGuard()
         self.tool_delay = tool_delay
         self.save_trajectories = save_trajectories
         self.verbose_logging = verbose_logging
@@ -12545,6 +12588,18 @@ class AIAgent:
                 assistant_message = normalized
                 finish_reason = normalized.finish_reason
                 
+                # ── Loop guard: detect stable response repetition ──
+                _reply_text = (assistant_message.content or "").strip()
+                if _reply_text:
+                    try:
+                        self._loop_guard.check(_reply_text)
+                    except AgentLoopDetectedError:
+                        self._vprint(
+                            f"{self.log_prefix}🔁 Loop detected! Switching to backup model.",
+                            force=True,
+                        )
+                        raise  # Re-raise to be caught by caller (gateway)
+
                 # Normalize content to string — some OpenAI-compatible servers
                 # (llama-server, etc.) return content as a dict or list instead
                 # of a plain string, which crashes downstream .strip() calls.
