@@ -11544,78 +11544,161 @@ class GatewayRunner:
                         _loop_rescue_count += 1
                         logger.warning(
                             "Loop detection triggered (%d/%d). "
-                            "Switching agent model to fallback and retrying…",
+                            "Activating fallback model for single-response rescue…",
                             _loop_rescue_count,
                             _max_rescue,
                         )
-                        # Evict the stale agent so a fresh one picks up the new model
-                        self._evict_cached_agent(session_key or "")
-                        # Determine fallback model
-                        _fb = getattr(self, "_fallback_model", None)
-                        if _fb is not None and isinstance(_fb, dict):
-                            _new_model = _fb.get("model") or _fb.get("name") or ""
-                        elif isinstance(_fb, list) and _fb:
-                            _new_model = _fb[0].get("model", _fb[0].get("name", ""))
-                        elif isinstance(_fb, str):
-                            _new_model = _fb
-                        else:
-                            _new_model = ""
-                        if _new_model:
-                            logger.info("Retrying session %s with model '%s'.", session_id, _new_model)
-                            # Replace this agent with a fresh one using the fallback model
-                            user_config = _load_gateway_config()
-                            _runtime = _resolve_runtime_agent_kwargs()
-                            _fb_cfg = {
-                                "api_key": _new_model,  # placeholder — will be overwritten
-                                "base_url": "",
-                                "provider": "",
-                                "api_mode": "",
+                        # ── Single-response rescue (do NOT rebuild the agent) ──
+                        # Strategy: activate the fallback model on the existing agent,
+                        # make ONE API call, inject its response into conversation
+                        # history, reset the LoopGuard, then switch back to primary
+                        # so the original model continues naturally.
+                        from run_agent import LoopGuard
+                        _rescue_success = False
+                        try:
+                            # 1. Activate fallback on the existing agent (in-place swap).
+                            #    This reuses the agent's existing _fallback_chain which
+                            #    is already populated from config.yaml via
+                            #    _try_activate_fallback().
+                            _fb_activated = agent._try_activate_fallback()
+                            if not _fb_activated:
+                                logger.error(
+                                    "Loop rescue failed: no fallback model available "
+                                    "(agent._fallback_chain exhausted).",
+                                )
+                                raise
+                            # 2. Make a single API call with the fallback model.
+                            #    Build a minimal messages payload from conversation
+                            #    history + a rescue-specific prompt.
+                            import openai
+                            _client = agent.client or openai.OpenAI(
+                                api_key=agent.api_key or "",
+                                base_url=agent.base_url or "http://localhost:30000/v1",
+                            )
+                            _fb_model = agent.model
+                            _fb_provider = (agent.provider or "").lower()
+
+                            # Build messages for the rescue call.
+                            # Use the original conversation_history (without the
+                            # user message that caused the loop) so the fallback
+                            # model sees the same context the primary model was
+                            # stuck in.
+                            _rescue_history = list(agent_history)
+
+                            # Append the user message so the fallback has full context
+                            _user_text = _run_message
+                            if _user_text:
+                                _rescue_history.append({"role": "user", "content": _user_text})
+
+                            # Build the rescue prompt — tells the fallback model
+                            # to produce a brief, non-repetitive response that
+                            # lets the primary model continue after being
+                            # interrupted from a loop.
+                            _rescue_system = (
+                                "You have been brought in as a fallback model because "
+                                "the main model entered a stable response loop "
+                                "(repeated the same output 3 times). "
+                                "Your job is to produce a BRIEF response that helps the "
+                                "conversation continue. Do NOT repeat what was said before. "
+                                "Do NOT generate a long explanation. "
+                                "Acknowledge the situation briefly and let the conversation proceed."
+                            )
+                            _rescue_messages = [{"role": "system", "content": _rescue_system}] + _rescue_history
+
+                            try:
+                                _rescue_response = _client.chat.completions.create(
+                                    model=_fb_model,
+                                    messages=_rescue_messages,
+                                    max_tokens=512,
+                                    temperature=0.7,
+                                )
+                            except Exception as _api_err:
+                                logger.error(
+                                    "Loop rescue API call to fallback model '%s' failed: %s",
+                                    _fb_model, _api_err,
+                                )
+                                raise
+
+                            # 3. Extract the fallback model's response content.
+                            _fb_content = _rescue_response.choices[0].message.content or ""
+
+                            # 4. Inject the fallback response into conversation history.
+                            #    This is what breaks the loop: the primary model will
+                            #    see its own repeated responses followed by the
+                            #    fallback's interrupting response.
+                            _rescue_msg = {
+                                "role": "assistant",
+                                "content": "[Loop-interrupt: injected by fallback model "
+                                           f"({_fb_model}). The primary model will now continue.] "
+                                           f"{_fb_content}",
                             }
-                            # Build a minimal fallback config
-                            if isinstance(_fb, dict):
-                                _fb_cfg["provider"] = _fb.get("provider", _runtime.get("provider", ""))
-                                _fb_cfg["base_url"] = _fb.get("base_url", _runtime.get("base_url", ""))
-                                _fb_cfg["api_key"] = _fb.get("api_key", _runtime.get("api_key", ""))
-                            elif isinstance(_fb, list) and _fb:
-                                _fb_cfg["provider"] = _fb[0].get("provider", _runtime.get("provider", ""))
-                                _fb_cfg["base_url"] = _fb[0].get("base_url", _runtime.get("base_url", ""))
-                                _fb_cfg["api_key"] = _fb[0].get("api_key", _runtime.get("api_key", ""))
+                            # Only inject if there's no tool-call response to preserve
+                            if not _rescue_history or _rescue_history[-1].get("role") != "assistant":
+                                _rescue_history.append(_rescue_msg)
                             else:
-                                _fb_cfg["provider"] = _runtime.get("provider", "")
-                                _fb_cfg["base_url"] = _runtime.get("base_url", "")
-                                _fb_cfg["api_key"] = _runtime.get("api_key", "")
-                            # Create a fresh agent with the fallback model
-                            from run_agent import IterationBudget
-                            agent = AIAgent(
-                                base_url=_fb_cfg["base_url"] or _runtime.get("base_url", ""),
-                                api_key=_fb_cfg["api_key"] or _runtime.get("api_key", ""),
-                                provider=_fb_cfg["provider"] or _runtime.get("provider", ""),
-                                api_mode=_fb_cfg["api_mode"] or _runtime.get("api_mode", ""),
-                                model=_new_model,
-                                max_iterations=agent.max_iterations,
-                                tool_delay=agent.tool_delay,
-                                enabled_toolsets=enabled_toolsets,
-                                disabled_toolsets=agent.disabled_toolsets if hasattr(agent, 'disabled_toolsets') else None,
-                                save_trajectories=agent.save_trajectories,
-                                verbose_logging=agent.verbose_logging,
-                                quiet_mode=agent.quiet_mode,
-                                ephemeral_system_prompt=agent.ephemeral_system_prompt,
+                                # Insert right after the last assistant message
+                                # (before the user message that caused the loop).
+                                for _idx in range(len(_rescue_history) - 1, -1, -1):
+                                    if _rescue_history[_idx].get("role") == "assistant":
+                                        _rescue_history.insert(_idx + 1, _rescue_msg)
+                                        break
+                                else:
+                                    _rescue_history.append(_rescue_msg)
+
+                            # 5. Reset the loop guard so the primary model gets
+                            #    a clean history slate on its next turn.
+                            agent._loop_guard = LoopGuard()
+
+                            # 6. Restore the primary runtime so the next
+                            #    run_conversation() call uses the primary model.
+                            #    MUST run even if the API call above failed —
+                            #    otherwise the agent is stuck on an unreachable
+                            #    fallback endpoint.
+                            #    Clear the cooldown set by _try_activate_fallback()
+                            #    so _restore_primary_runtime() won't be blocked.
+                            agent._rate_limited_until = 0
+                            agent._restore_primary_runtime()
+
+                            _rescue_success = True
+                            logger.info(
+                                "Loop rescue successful: injected fallback response "
+                                "from %s (%s). Resuming with primary model.",
+                                _fb_model, agent.provider or "unknown",
                             )
-                            # Inject loop context into the user message for the retry
-                            _loop_context = (
-                                "[System note: Your previous turn was interrupted because the model "
-                                "entered a stable response loop (repeated the same output 3 times). "
-                                "A different model is now handling this session. "
-                                "Please review the conversation history and continue working on the task.]"
-                            )
-                            _run_message = _loop_context + "\n\n" + _run_message
-                        else:
+                        except Exception as _rescue_err:
                             logger.error(
-                                "Loop detected but no fallback model configured for session %s. "
-                                "Raising the exception.",
-                                session_id,
+                                "Loop rescue failed (will re-raise): %s",
+                                _rescue_err,
+                                exc_info=True,
                             )
-                            raise
+                            # Don't raise here — let the main loop retry with
+                            # the primary model. The primary may recover on
+                            # its own (e.g. context compression may help).
+                            # We already incremented _loop_rescue_count, so
+                            # further loop detections will hit the max limit.
+
+                        # 7. If rescue succeeded, continue to the next iteration
+                        #    which will call run_conversation() with the primary
+                        #    model and the updated agent_history.
+                        if _rescue_success:
+                            # Sync: insert the rescue message AFTER the last
+                            # assistant in agent_history.  When
+                            # run_conversation() runs again it copies
+                            # agent_history + appends _run_message, so the
+                            # model sees: assistant(looped) → rescue(fallback)
+                            # → user(new).  This ordering breaks the loop.
+                            _last_asst = -1
+                            for _si in range(len(agent_history) - 1, -1, -1):
+                                if agent_history[_si].get("role") == "assistant":
+                                    _last_asst = _si
+                                    break
+                            if _last_asst >= 0:
+                                agent_history.insert(_last_asst + 1, _rescue_msg)
+                            else:
+                                agent_history.append(_rescue_msg)
+                        # If rescue failed, fall through to the next iteration
+                        # which will try the primary model again. If it loops,
+                        # _loop_rescue_count >= _max_rescue will raise.
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)

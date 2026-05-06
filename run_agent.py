@@ -7620,8 +7620,11 @@ class AIAgent:
         if not self._fallback_activated:
             return False
 
-        if getattr(self, "_rate_limited_until", 0) > time.monotonic():
-            return False  # primary still in rate-limit cooldown, stay on fallback
+        # Always clear the cooldown so we get a fresh attempt with the primary
+        # model every turn.  The cooldown was meant to prevent hammering a
+        # rate-limited primary, but staying on the fallback forever is worse.
+        # If the primary is still down we'll fall back again naturally.
+        self._rate_limited_until = 0
 
         rt = self._primary_runtime
         try:
