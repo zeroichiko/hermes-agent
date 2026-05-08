@@ -317,20 +317,24 @@ def _handle_nonstreaming(message, request):
 # ─── Web UI Endpoints (llama.cpp style) ──────────────────────────────────────
 
 def _load_webui_files():
-    """Load web UI files if available."""
+    """Load web UI files if available. Returns (index_html, app_js, style_css, bundle_js, bundle_css, loading_html).
+    bundle_js/bundle_css are optional fallbacks — missing files return None for those slots only."""
     if not os.path.exists(WEBUI_DIR):
-        return None, None, None, None, None
-
-    try:
-        index_html = open(os.path.join(WEBUI_DIR, "index.html"), "rb").read()
-        app_js = open(os.path.join(WEBUI_DIR, "app.js"), "rb").read()
-        style_css = open(os.path.join(WEBUI_DIR, "style.css"), "rb").read()
-        bundle_js = open(os.path.join(WEBUI_DIR, "bundle.js"), "rb").read()
-        bundle_css = open(os.path.join(WEBUI_DIR, "bundle.css"), "rb").read()
-        loading_html = open(os.path.join(WEBUI_DIR, "loading.html"), "rb").read()
-        return index_html, app_js, style_css, bundle_js, bundle_css, loading_html
-    except Exception:
         return None, None, None, None, None, None
+
+    def _read_file(name):
+        path = os.path.join(WEBUI_DIR, name)
+        if os.path.exists(path):
+            return open(path, "rb").read()
+        return None
+
+    index_html = _read_file("index.html")
+    app_js = _read_file("app.js")
+    style_css = _read_file("style.css")
+    bundle_js = _read_file("bundle.js")
+    bundle_css = _read_file("bundle.css")
+    loading_html = _read_file("loading.html")
+    return index_html, app_js, style_css, bundle_js, bundle_css, loading_html
 
 
 @app.get("/", response_class=HTMLResponse)
