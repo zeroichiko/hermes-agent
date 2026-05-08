@@ -336,7 +336,7 @@ def _load_webui_files():
 @app.get("/", response_class=HTMLResponse)
 async def web_ui_index():
     """Serve the llama.cpp-style chat UI."""
-    index_html, _, _, _ = _load_webui_files()
+    index_html, _, _, _, _, _ = _load_webui_files()
     if index_html:
         return HTMLResponse(
             content=index_html.decode("utf-8"),
@@ -354,7 +354,7 @@ async def web_ui_index():
 @app.get("/index.html")
 async def web_ui_index_html():
     """Serve index.html."""
-    index_html, _, _, _ = _load_webui_files()
+    index_html, _, _, _, _, _ = _load_webui_files()
     if index_html:
         return Response(content=index_html, media_type="text/html; charset=utf-8")
     return Response(status_code=503)
@@ -399,7 +399,7 @@ async def web_ui_bundle_css():
 @app.get("/loading.html")
 async def web_ui_loading():
     """Serve loading indicator."""
-    _, _, _, loading_html = _load_webui_files()
+    _, _, _, _, _, loading_html = _load_webui_files()
     if loading_html:
         return HTMLResponse(content=loading_html.decode("utf-8"))
     return HTMLResponse("<html><body>Loading...</body></html>")
