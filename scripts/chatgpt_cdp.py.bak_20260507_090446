@@ -1,0 +1,1158 @@
+#!/usr/bin/env python3
+"""
+chatgpt_cdp.py — ChatGPT 未登入模式 CDP 自動化
+
+使用 Chrome 9222 CDP 在未經登入的 ChatGPT 中對話。
+自動偵測並關閉「尚未登入」彈窗，之後全部操作由本工具自動化。
+
+需求: pip install websocket-client
+預設 Chrome CDP port: 9222
+
+Usage:
+  python3 chatgpt_cdp.py status                     # 檢查頁面狀態
+  python3 chatgpt_cdp.py type <msg>                 # 在輸入框打字（不送出）
+  python3 chatgpt_cdp.py ask <msg>                  # 打字 + 送出 + 等待回覆
+  python3 chatgpt_cdp.py ask <msg> --wait <sec>     # 指定等待秒數
+  python3 chatgpt_cdp.py ask <msg> --timeout <sec>  # 設定 CDP 回應 timeout
+  python3 chatgpt_cdp.py ask <msg> --screenshot <f> # 截圖儲存
+  python3 chatgpt_cdp.py history [lines]             # 取得對話歷史文字
+  python3 chatgpt_cdp.py screenshot <file>           # 截圖
+  python3 chatgpt_cdp.py html <file>                 # 儲存頁面 HTML
+  python3 chatgpt_cdp.py close-modal                 # 提示使用者手動關閉彈窗
+  python3 chatgpt_cdp.py tabs                        # 列出所有分頁
+  python3 chatgpt_cdp.py goto <url>                  # 導航到指定 URL
+  python3 chatgpt_cdp.py eval <js_code>              # 執行 JavaScript
+
+Examples:
+  python3 chatgpt_cdp.py ask "你好，請自我介紹"
+  python3 chatgpt_cdp.py ask "Write a Python bubble sort" --screenshot /tmp/sort.jpg
+  python3 chatgpt_cdp.py status
+  python3 chatgpt_cdp.py close-modal
+  python3 chatgpt_cdp.py tabs
+"""
+
+import websocket, json, urllib.request, base64, re, sys, time, os, argparse
+
+PORT = 9222
+BASE = f"http://127.0.0.1:{PORT}"
+
+
+# ─── Core Helpers ───────────────────────────────────────────────────────────
+
+def get_tabs():
+    """Get all Chrome tabs from CDP endpoint."""
+    with urllib.request.urlopen(f"{BASE}/json") as r:
+        return json.loads(r.read())
+
+
+def find_chatgpt_tab(tabs):
+    """Find ChatGPT tab in tab list."""
+    for t in tabs:
+        if 'chatgpt' in t.get('url', '').lower():
+            return t
+    return tabs[0] if tabs else None
+
+
+def connect(tab_id=None, drain=50):
+    """Connect to Chrome tab CDP and enable domains. Returns (ws, tab, drained)."""
+    tabs = get_tabs()
+    if not tabs:
+        print("✗ No Chrome tabs found. Is Chrome running with --remote-debugging-port=9222?",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if tab_id:
+        tab = next((t for t in tabs if t["id"] == tab_id), tabs[0])
+    else:
+        tab = find_chatgpt_tab(tabs)
+
+    if not tab:
+        print("✗ No ChatGPT tab found.", file=sys.stderr)
+        sys.exit(1)
+
+    ws = websocket.create_connection(tab["webSocketDebuggerUrl"])
+
+    # Enable CDP domains
+    for cmd_id, method in [(1, "Page.enable"), (2, "Runtime.enable"), (3, "DOM.enable")]:
+        ws.send(json.dumps({"id": cmd_id, "method": method}))
+
+    # Drain events — CRITICAL for SPA pages like ChatGPT
+    # ChatGPT floods the WS with events on every state change
+    drained = 0
+    for _ in range(drain + 10):
+        ws.settimeout(0.3)
+        try:
+            json.loads(ws.recv())
+            drained += 1
+        except:
+            break
+
+    return ws, tab, drained
+
+
+def send_cmd(ws, cmd_id, method, params=None):
+    """Send a CDP command."""
+    ws.send(json.dumps({"id": cmd_id, "method": method, "params": params or {}}))
+
+
+def recv_resp(ws, cmd_id, timeout=5):
+    """Wait for a CDP response by command id. Returns raw msg dict or None."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return None
+        ws.settimeout(min(0.5, remaining))
+        try:
+            msg = json.loads(ws.recv())
+            if msg.get("id") == cmd_id:
+                return msg
+        except:
+            pass
+    return None
+
+
+def recv_result(ws, cmd_id, timeout=5):
+    """Wait for CDP response and extract the result dict."""
+    msg = recv_resp(ws, cmd_id, timeout)
+    if msg:
+        return msg.get("result", {})
+    return None
+
+
+def eval_js(ws, cmd_id, expr, timeout=10):
+    """Evaluate JS with returnByValue=True. Returns deserialized primitive or None."""
+    send_cmd(ws, cmd_id, "Runtime.evaluate",
+             {"expression": expr, "returnByValue": True})
+    result = recv_result(ws, cmd_id, timeout)
+    if not result:
+        return None
+    inner = result.get("result", {})
+    if not isinstance(inner, dict):
+        return result
+    val = inner.get("value")
+    if val is not None:
+        return val
+    desc = inner.get("description", "")
+    return desc if desc else result
+
+
+def drain_events(ws, count=5):
+    """Drain N events from the WebSocket."""
+    for _ in range(count):
+        ws.settimeout(0.2)
+        try:
+            json.loads(ws.recv())
+        except:
+            break
+
+
+def is_login_modal_present(ws):
+    """Detect if the '尚未登入' / login modal overlay is visible.
+
+    Returns dict with detection results:
+      {'hasModal': bool, 'isLandingPage': bool, 'bodySnippet': str,
+       'overlayInfo': dict|None, 'buttons': [...]}
+    """
+    result = eval_js(ws, 90, """
+    (function() {
+        var body = document.body.innerText;
+        var result = {
+            hasKeywords: false,
+            bodySnippet: body.substring(0, 200),
+            isLandingPage: false,
+            hasModal: false,
+            overlayInfo: null,
+            overlayButtons: []
+        };
+
+        // Check for login keywords
+        var keywords = ['登入', 'Login', 'Sign in', '尚未登入', '免費註冊', 'Sign up'];
+        result.hasKeywords = keywords.some(function(kw) { return body.includes(kw); });
+
+        // Check for textarea — if it exists and is visible, it's likely a normal page
+        var textarea = document.querySelector('textarea');
+        var textareaVisible = false;
+        if (textarea) {
+            textareaVisible = textarea.offsetParent !== null;
+            result.textareaVisible = true;
+        } else {
+            result.textareaVisible = false;
+        }
+
+        // EXCLUSION: Known non-modal class patterns
+        var nonModalClasses = [
+            'composer-parent',
+            'flex flex-1',
+            'flex flex-col',
+            'thread-list',
+            'sidebar',
+            'max-w-full',
+            'max-w-3xl',
+            'max-w-4xl',
+            'max-w-full',
+            'sticky bottom-0',
+            'thread-content-max-width',
+            'thread-content',
+        ];
+
+        // Check for actual modal/dialog elements
+        // Use very specific selectors that are unlikely to match normal page elements
+        var dialogSelectors = [
+            '[role="dialog"]',
+            // Be very specific about presentation role — must have modal-like classes
+            '[role="presentation"][class*="modal"]',
+            '[role="presentation"][class*="overlay"]',
+            '[role="presentation"][class*="backdrop"]',
+            '[role="presentation"][class*="popup"]',
+            '[role="presentation"][class*="signin"]',
+            '[role="presentation"][class*="login"]',
+            '[role="presentation"][class*="signin"]',
+            '[role="presentation"][class*="sign-in"]',
+        ];
+        var overlays = document.querySelectorAll(dialogSelectors.join(', '));
+        var visibleOverlays = [];
+        for (var i = 0; i < overlays.length; i++) {
+            var el = overlays[i];
+            var style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+
+            // Skip if it's a known non-modal element
+            var cls = (typeof el.className === 'string') ? el.className : '';
+            var isNonModal = nonModalClasses.some(function(nc) { return cls.indexOf(nc) !== -1; });
+            if (isNonModal) continue;
+
+            var rect = el.getBoundingClientRect();
+            var coverage = (rect.width * rect.height) / (window.innerWidth * window.innerHeight);
+
+            if (coverage > 0.3) {
+                visibleOverlays.push({
+                    tag: el.tagName,
+                    role: el.getAttribute('role'),
+                    classes: cls.substring(0, 100),
+                    coverage: Math.round(coverage * 100) + '%',
+                    text: (el.textContent || '').trim().substring(0, 100)
+                });
+                result.hasModal = true;
+            }
+        }
+        result.overlayInfo = visibleOverlays.length > 0 ? visibleOverlays[0] : null;
+
+        // Also check for any visible element with modal-like classes covering screen
+        if (!result.hasModal) {
+            var modalClassSelectors = [
+                '[class*="login-modal"]',
+                '[class*="sign-in-modal"]',
+                '[class*="signin-modal"]',
+                '[class*="sign_in_modal"]',
+                '[class*="auth-modal"]',
+                '[class*="auth-modal"]',
+                '[class*="login-overlay"]',
+                '[class*="login_backdrop"]',
+                // Generic modal class patterns
+                '[class*="-modal"]',
+                '[class*="_modal"]',
+                '[class*="__modal"]',
+            ];
+            var classOverlays = document.querySelectorAll(modalClassSelectors.join(', '));
+            for (var j = 0; j < classOverlays.length; j++) {
+                var el = classOverlays[j];
+                var style2 = window.getComputedStyle(el);
+                if (style2.display === 'none' || style2.visibility === 'hidden') continue;
+
+                var cls2 = (typeof el.className === 'string') ? el.className : '';
+                if (nonModalClasses.some(function(nc) { return cls2.indexOf(nc) !== -1; })) continue;
+
+                var rect2 = el.getBoundingClientRect();
+                var coverage2 = (rect2.width * rect2.height) / (window.innerWidth * window.innerHeight);
+                if (coverage2 > 0.2) {
+                    visibleOverlays.push({
+                        tag: el.tagName,
+                        classes: cls2.substring(0, 100),
+                        coverage: Math.round(coverage2 * 100) + '%',
+                        text: (el.textContent || '').trim().substring(0, 100)
+                    });
+                    result.hasModal = true;
+                    result.overlayInfo = visibleOverlays[visibleOverlays.length - 1];
+                }
+            }
+        }
+
+        // Check for visible overlay elements using background/backdrop approach
+        if (!result.hasModal) {
+            // Look for elements with semi-transparent dark background covering screen
+            // This is the most reliable way to detect login modals
+            var allDivs = document.querySelectorAll('div, section, main');
+            for (var k = 0; k < allDivs.length; k++) {
+                var el = allDivs[k];
+                var style3 = window.getComputedStyle(el);
+                if (style3.display === 'none' || style3.visibility === 'hidden') continue;
+
+                var rect3 = el.getBoundingClientRect();
+                var coverage3 = (rect3.width * rect3.height) / (window.innerWidth * window.innerHeight);
+                if (coverage3 < 0.4 || coverage3 > 0.95) continue; // Skip too small or page-level
+
+                var cls3 = (typeof el.className === 'string') ? el.className : '';
+                if (nonModalClasses.some(function(nc) { return cls3.indexOf(nc) !== -1; })) continue;
+
+                // Check if this element has a dark semi-transparent background
+                // This is characteristic of modal backdrops
+                var bgColor = style3.backgroundColor;
+                var hasDarkBg = bgColor && (
+                    bgColor.includes('rgba') && bgColor.includes('0.') ||
+                    bgColor.includes('0, 0, 0') ||
+                    bgColor.includes('0,0,0')
+                );
+
+                // Check if this element contains close-related text
+                var innerText = (el.textContent || '').trim();
+                var hasCloseText = innerText.includes('✕') || innerText.includes('✖') ||
+                                   innerText.includes('×') || innerText.includes('關閉') ||
+                                   innerText.includes('Close') || innerText.includes('close') ||
+                                   innerText.includes('dismiss') || innerText.includes('Dismiss');
+
+                // Check if it contains login-related text
+                var hasLoginText = innerText.includes('登入') || innerText.includes('Login') ||
+                                   innerText.includes('Sign in') || innerText.includes('Sign up') ||
+                                   innerText.includes('免費註冊');
+
+                if (hasDarkBg && hasCloseText && hasLoginText) {
+                    visibleOverlays.push({
+                        tag: el.tagName,
+                        classes: cls3.substring(0, 100),
+                        coverage: Math.round(coverage3 * 100) + '%',
+                        text: innerText.substring(0, 100)
+                    });
+                    result.hasModal = true;
+                    result.overlayInfo = visibleOverlays[visibleOverlays.length - 1];
+                    break; // Found it, stop searching
+                }
+            }
+        }
+
+        // Heuristic: if textarea is visible AND no overlay covers >20%, not a modal
+        if (textareaVisible && !result.hasModal) {
+            result.isLandingPage = true;
+        }
+
+        // Find close buttons in overlays
+        if (result.overlayInfo) {
+            var overlayEl = document.querySelector(result.overlayInfo.classes);
+            if (!overlayEl) {
+                // Try to find the overlay element by checking role
+                overlayEl = document.querySelector('[role="dialog"], [role="presentation"]');
+            }
+            // Search more broadly for close buttons in the overlay area
+            var overlayRect = result.overlayInfo._rect || document.body.getBoundingClientRect();
+            var allCloseBtns = document.querySelectorAll('button, [role="button"], [tabindex="0"]');
+            for (var m = 0; m < allCloseBtns.length; m++) {
+                var btn = allCloseBtns[m];
+                var bStyle = window.getComputedStyle(btn);
+                if (bStyle.display === 'none' || bStyle.visibility === 'hidden') continue;
+                var btnRect = btn.getBoundingClientRect();
+                if (btnRect.width < 10 || btnRect.height < 10) continue;
+
+                var btnText = (btn.textContent || '').trim();
+                var btnAria = (btn.getAttribute('aria-label') || '').toLowerCase();
+                var btnCls = (typeof btn.className === 'string') ? btn.className.toLowerCase() : '';
+
+                // Check if this button is likely a close button
+                var isClose = ['close', 'dismiss', '✕', '✖', '×', 'x', 'X', '關閉'].some(function(kw) {
+                    return btnAria.indexOf(kw.toLowerCase()) !== -1 ||
+                           btnText.toLowerCase().indexOf(kw.toLowerCase()) !== -1 ||
+                           btnCls.indexOf(kw.toLowerCase()) !== -1;
+                });
+
+                if (isClose) {
+                    result.overlayButtons.push({
+                        tag: btn.tagName,
+                        text: btnText,
+                        ariaLabel: btnAria,
+                        classes: btnCls.substring(0, 80),
+                        parentTag: btn.parentElement ? btn.parentElement.tagName : '',
+                        parentClasses: btn.parentElement ? (typeof btn.parentElement.className === 'string' ? btn.parentElement.className : '') : ''
+                    });
+                }
+            }
+        }
+
+        return result;
+    })()
+    """)
+    return result
+
+
+def find_closest_close_button(ws):
+    """Find the most likely close button for the login modal.
+
+    Returns dict with keys: selector, tag, text, ariaLabel
+    or None.
+    """
+    result = eval_js(ws, 95, """
+    (function() {
+        // Strategy 1: Look for buttons with close/dismiss in aria-label
+        var ariaSelectors = [
+            '[aria-label*="close"]',
+            '[aria-label*="Close"]',
+            '[aria-label*="dismiss"]',
+            '[aria-label*="Dismiss"]',
+            '[aria-label*="✕"]',
+            '[aria-label*="✖"]',
+            '[aria-label*="x"]',
+            '[aria-label*="X"]',
+            '[aria-label*="關閉"]',
+        ];
+
+        for (var i = 0; i < ariaSelectors.length; i++) {
+            var el = document.querySelector(ariaSelectors[i]);
+            if (el) {
+                var rect = el.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                    return {
+                        selector: ariaSelectors[i],
+                        tag: el.tagName,
+                        text: (el.textContent || '').trim().substring(0, 30),
+                        ariaLabel: el.getAttribute('aria-label') || ''
+                    };
+                }
+            }
+        }
+
+        // Strategy 2: Look for buttons with close/dismiss in visible text
+        var textSelectors = [
+            'button:contains("✕")',
+            'button:contains("✖")',
+            'button:contains("X")',
+            'button:contains("Close")',
+            'button:contains("close")',
+            'button:contains("Dismiss")',
+            'button:contains("dismiss")',
+            'button:contains("關閉")',
+        ];
+        // Since :contains is not standard, search manually
+        var allButtons = document.querySelectorAll('button, [role="button"]');
+        for (var j = 0; j < allButtons.length; j++) {
+            var btn = allButtons[j];
+            var rect = btn.getBoundingClientRect();
+            if (rect.width < 15 || rect.height < 15) continue;
+
+            var text = (btn.textContent || '').trim();
+            var aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+
+            // Look for X or ✕ or Close in text/aria
+            if (text === 'X' || text === '✕' || text === '✖' ||
+                text === 'Close' || text === 'close' || text === '關閉' ||
+                text === 'Dismiss' || text === 'dismiss' ||
+                aria.indexOf('close') !== -1 ||
+                aria.indexOf('✕') !== -1 ||
+                aria.indexOf('✖') !== -1 ||
+                aria.indexOf('關閉') !== -1) {
+                return {
+                    selector: 'button[' + j + ']',
+                    tag: btn.tagName,
+                    text: text,
+                    ariaLabel: btn.getAttribute('aria-label') || ''
+                };
+            }
+        }
+
+        // Strategy 3: Look for small circular buttons in top-right corner of dialog
+        // These are typically close buttons (small, round, near edge)
+        var dialog = document.querySelector('[role="dialog"], [role="presentation"]');
+        if (dialog) {
+            var dialogRect = dialog.getBoundingClientRect();
+            var smallButtons = [];
+            var btns = dialog.querySelectorAll('button, [role="button"]');
+            for (var k = 0; k < btns.length; k++) {
+                var b = btns[k];
+                var br = b.getBoundingClientRect();
+                if (br.width < 50 && br.height < 50 && br.width > 0 && br.height > 0) {
+                    // Small button — likely an icon button (close, settings, etc.)
+                    // Check if it's near top-right corner of dialog
+                    var relX = br.left - dialogRect.left;
+                    var relY = br.top - dialogRect.top;
+                    var dialogW = dialogRect.width;
+                    smallButtons.push({
+                        btn: b,
+                        relX: relX,
+                        relY: relY,
+                        size: Math.min(br.width, br.height),
+                        text: (b.textContent || '').trim(),
+                        ariaLabel: b.getAttribute('aria-label') || ''
+                    });
+                }
+            }
+            // Sort by distance to top-right corner, pick closest
+            if (smallButtons.length > 0) {
+                smallButtons.sort(function(a, b) {
+                    var da = Math.abs(a.relX - dialogW) + a.relY;
+                    var db = Math.abs(b.relX - dialogW) + b.relY;
+                    return da - db;
+                });
+                var best = smallButtons[0];
+                // Only use if it's reasonably close to top-right (within 10% of dialog width from edge)
+                if (Math.abs(best.relX - dialogW) < dialogW * 0.15 ||
+                    best.relY < dialogRect.height * 0.15) {
+                    return {
+                        selector: 'small-top-right-btn',
+                        tag: best.btn.tagName,
+                        text: best.text,
+                        ariaLabel: best.ariaLabel
+                    };
+                }
+            }
+        }
+
+        // Strategy 4: First button in dialog that's NOT the first major action button
+        // (skip submit/send buttons)
+        if (dialog) {
+            var allDialogBtns = dialog.querySelectorAll('button');
+            var skipTexts = ['send', 'send message', 'submit', 'send message to', '傳送', '送出'];
+            for (var l = 0; l < allDialogBtns.length; l++) {
+                var db = allDialogBtns[l];
+                var dbText = (db.textContent || '').toLowerCase().trim();
+                var dbAria = (db.getAttribute('aria-label') || '').toLowerCase();
+                // Skip if this is clearly a send/submit button
+                if (skipTexts.some(function(s) { return dbText.indexOf(s) !== -1 || dbAria.indexOf(s) !== -1; })) continue;
+                // Also skip if it's large (action buttons are usually larger)
+                var dbr = db.getBoundingClientRect();
+                if (dbr.width > 80 || dbr.height > 40) continue;
+                return {
+                    selector: 'dialog-other-button',
+                    tag: db.tagName,
+                    text: dbText.substring(0, 30),
+                    ariaLabel: dbAria
+                };
+            }
+        }
+
+        return null;
+    })()
+    """)
+    if result and isinstance(result, dict):
+        return result
+    return None
+
+
+def click_close_button(ws, btn_info):
+    """Click the close button using Input.dispatchMouseEvent.
+
+    btn_info: dict with keys like 'selector', 'text', 'ariaLabel'
+    Returns True on success.
+    """
+    # First, evaluate the button's bounding rect
+    selector = btn_info.get('selector', '')
+
+    if selector == 'small-top-right-btn':
+        # Strategy 3: find the small button closest to top-right of dialog
+        rect = eval_js(ws, 96, """
+        (function() {
+            var dialog = document.querySelector('[role="dialog"], [role="presentation"]');
+            if (!dialog) return null;
+            var dialogRect = dialog.getBoundingClientRect();
+            var smallBtns = [];
+            var btns = dialog.querySelectorAll('button, [role="button"]');
+            for (var i = 0; i < btns.length; i++) {
+                var b = btns[i];
+                var br = b.getBoundingClientRect();
+                if (br.width < 50 && br.height < 50 && br.width > 0 && br.height > 0) {
+                    var relX = br.left - dialogRect.left;
+                    var relY = br.top - dialogRect.top;
+                    smallBtns.push({btn: b, relX: relX, relY: relY,
+                        size: Math.min(br.width, br.height)});
+                }
+            }
+            if (smallBtns.length === 0) return null;
+            smallBtns.sort(function(a, b) {
+                var da = Math.abs(a.relX - dialogRect.width) + a.relY;
+                var db = Math.abs(b.relX - dialogRect.width) + b.relY;
+                return da - db;
+            });
+            var best = smallBtns[0];
+            var br = best.btn.getBoundingClientRect();
+            return {x: Math.round(br.x + br.width/2), y: Math.round(br.y + br.height/2),
+                    width: Math.round(br.width), height: Math.round(br.height), tag: best.btn.tagName};
+        })()
+        """)
+    elif selector == 'dialog-other-button':
+        # Strategy 4: first non-send, non-large button in dialog
+        rect = eval_js(ws, 96, """
+        (function() {
+            var dialog = document.querySelector('[role="dialog"], [role="presentation"]');
+            if (!dialog) return null;
+            var skipTexts = ['send', 'send message', 'submit', '傳送', '送出'];
+            var btns = dialog.querySelectorAll('button');
+            for (var i = 0; i < btns.length; i++) {
+                var b = btns[i];
+                var br = b.getBoundingClientRect();
+                if (br.width < 15 || br.height < 15) continue;
+                var text = (b.textContent || '').toLowerCase().trim();
+                var aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                if (skipTexts.some(function(s) { return text.indexOf(s) !== -1 || aria.indexOf(s) !== -1; })) continue;
+                if (br.width > 80 || br.height > 40) continue;
+                br = b.getBoundingClientRect();
+                return {x: Math.round(br.x + br.width/2), y: Math.round(br.y + br.height/2),
+                        width: Math.round(br.width), height: Math.round(br.height), tag: b.tagName};
+            }
+            return null;
+        })()
+        """)
+    else:
+        # Standard selector
+        js_expr = f"""
+        (function() {{
+            var btn = {get_js_object(btn_info)};
+            if (!btn) return null;
+            var rect = btn.getBoundingClientRect();
+            return {{
+                x: Math.round(rect.x + rect.width / 2),
+                y: Math.round(rect.y + rect.height / 2),
+                width: Math.round(rect.width),
+                height: Math.round(rect.height),
+                tag: btn.tagName
+            }};
+        }})()
+        """
+        rect = eval_js(ws, 96, js_expr)
+
+    if not rect or not isinstance(rect, dict):
+        print(f"  ✗ Could not compute button rect for: {btn_info}")
+        return False
+
+    # Scroll button into view first
+    if selector == 'small-top-right-btn':
+        scroll_js = """
+        (function() {
+            var dialog = document.querySelector('[role="dialog"], [role="presentation"]');
+            if (!dialog) return;
+            var btns = dialog.querySelectorAll('button, [role="button"]');
+            var dialogRect = dialog.getBoundingClientRect();
+            var best = null;
+            var bestDist = Infinity;
+            for (var i = 0; i < btns.length; i++) {
+                var b = btns[i];
+                var br = b.getBoundingClientRect();
+                if (br.width < 50 && br.height < 50 && br.width > 0) {
+                    var relX = br.left - dialogRect.left;
+                    var dist = Math.abs(relX - dialogRect.width);
+                    if (dist < bestDist) { bestDist = dist; best = b; }
+                }
+            }
+            if (best) best.scrollIntoView({behavior: 'instant', block: 'center', inline: 'nearest'});
+        })()
+        """
+    elif selector == 'dialog-other-button':
+        scroll_js = """
+        (function() {
+            var dialog = document.querySelector('[role="dialog"], [role="presentation"]');
+            if (!dialog) return;
+            var btns = dialog.querySelectorAll('button');
+            for (var i = 0; i < btns.length; i++) {
+                var b = btns[i];
+                var br = b.getBoundingClientRect();
+                if (br.width < 15 || br.height < 15) continue;
+                var text = (b.textContent || '').toLowerCase().trim();
+                if (text.indexOf('send') !== -1 || text.indexOf('送') !== -1) continue;
+                if (br.width > 80 || br.height > 40) continue;
+                b.scrollIntoView({behavior: 'instant', block: 'center', inline: 'nearest'});
+                return;
+            }
+        })()
+        """
+    else:
+        scroll_js = f"""
+        (function() {{
+            var btn = {get_js_object(btn_info)};
+            if (btn) btn.scrollIntoView({{behavior: 'instant', block: 'center', inline: 'nearest'}});
+        }})()
+        """
+
+    eval_js(ws, 97, scroll_js)
+    time.sleep(0.3)
+
+    # Mouse move to center of button
+    send_cmd(ws, 98, "Input.dispatchMouseEvent", {
+        "type": "mousePressed",
+        "x": rect["x"],
+        "y": rect["y"],
+        "button": "left",
+        "clickCount": 1
+    })
+    time.sleep(0.1)
+
+    print(f"  ✓ Clicked close button at ({rect['x']}, {rect['y']}) [{btn_info.get('text', '')}]")
+    return True
+
+
+def get_js_object(btn_info):
+    """Convert a button info dict into a JS expression that finds the button.
+
+    For standard CSS selectors, returns document.querySelector(...).
+    For other cases, tries aria-label matching.
+    """
+    if not btn_info:
+        return "null"
+
+    selector = btn_info.get('selector', '')
+
+    if selector and not selector.startswith('small-') and not selector.startswith('dialog-'):
+        return f"document.querySelector('{selector}')".replace("'", "\\'")
+
+    # Fallback: by aria-label
+    aria = btn_info.get('ariaLabel', '').replace("'", "\\'")
+    if aria:
+        return f"document.querySelector('[aria-label*=\"{aria}\"]')".replace("'", "\\'")
+
+    # Fallback: by text content
+    text = btn_info.get('text', '').replace("'", "\\'")
+    if text:
+        return f"document.evaluate(\"//*[contains(text(), '{text}')]/..\", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue".replace("'", "\\'")
+
+    return "null"
+
+
+def close_login_modal_auto(ws):
+    """Automatically detect and close the login modal if present.
+
+    Returns:
+        True if modal was present and closed, False if not present.
+    """
+    detection = is_login_modal_present(ws)
+    if not isinstance(detection, dict):
+        print("  ⚠ Could not detect page state")
+        return False
+
+    has_modal = detection.get('hasModal', False)
+    is_landing = detection.get('isLandingPage', False)
+    overlay_info = detection.get('overlayInfo', None)
+    buttons = detection.get('overlayButtons', [])
+    body_snippet = detection.get('bodySnippet', '')
+    textarea_visible = detection.get('textareaVisible', False)
+
+    # If it's the landing page (welcome screen), that's NOT a modal
+    # The welcome screen has "登入"/"免費註冊" as normal page content
+    if is_landing and not has_modal:
+        print(f"  Landing page detected (textarea visible: {textarea_visible})")
+        return False
+
+    if not has_modal:
+        return False
+
+    # We have an actual modal overlay
+    print("  ⚠ Login modal detected!")
+    if overlay_info:
+        print(f"  Overlay: <{overlay_info.get('tag','')}>"
+              f" role={overlay_info.get('role','')}>"
+              f" coverage={overlay_info.get('coverage','')}")
+        print(f"  Body preview: {body_snippet[:100]}...")
+
+    # Find close button
+    btn_info = find_closest_close_button(ws)
+
+    if btn_info:
+        print(f"  Found close button: text='{btn_info.get('text','')}' ariaLabel='{btn_info.get('ariaLabel','')}'")
+        click_close_button(ws, btn_info)
+        time.sleep(0.5)
+
+        # Verify modal is gone
+        post_detection = is_login_modal_present(ws)
+        if post_detection and post_detection.get('hasModal', False):
+            print("  ⚠ Modal still visible after close attempt — retrying...")
+            time.sleep(0.5)
+            # Try alternative: close the dialog element itself
+            count = eval_js(ws, 99, """
+            (function() {
+                var overlays = document.querySelectorAll('[role="dialog"], [role="presentation"], dialog, .modal, .overlay, [class*="modal"], [class*="overlay"], [class*="popup"]');
+                overlays.forEach(function(el) { el.style.display = 'none'; });
+                return overlays.length;
+            })()
+            """)
+            if count:
+                print(f"  ✓ Hidden {count} overlay element(s) via fallback")
+            else:
+                print("  ⚠ Fallback also failed")
+            time.sleep(0.5)
+            post2 = is_login_modal_present(ws)
+            if post2 and post2.get('hasModal', False):
+                print("  ⚠ Modal still present after fallback — may need manual intervention")
+                return True
+            print("  ✓ Modal closed (via fallback)")
+            drain_events(ws, 20)
+            return True
+
+        print("  ✓ Modal closed successfully")
+        drain_events(ws, 20)
+        return True
+
+    # Fallback: try to hide dialog elements directly
+    print("  No close button found, attempting direct overlay removal...")
+    count = eval_js(ws, 99, """
+    (function() {
+        var overlays = document.querySelectorAll('[role="dialog"], [role="presentation"], dialog, .modal, .overlay, [class*="modal"], [class*="overlay"], [class*="popup"]');
+        overlays.forEach(function(el) { el.style.display = 'none'; });
+        return overlays.length;
+    })()
+    """)
+    if count:
+        print(f"  ✓ Hidden {count} overlay element(s)")
+        drain_events(ws, 20)
+        return True
+
+    print("  ✗ Could not close modal")
+    return False
+
+
+# ─── Commands ────────────────────────────────────────────────────────────────
+
+def cmd_status(ws, tab):
+    """Check current ChatGPT page status."""
+    print(f"Tab: {tab.get('title', 'N/A')}")
+    print(f"URL: {tab.get('url', 'N/A')}\n")
+
+    ready = eval_js(ws, 10, "document.readyState")
+    print(f"readyState: {ready or '?'}")
+
+    body = eval_js(ws, 11, "document.body.innerText.substring(0,800)")
+    if body:
+        print(f"\nPage text (first 800 chars):")
+        for line in body.strip().split('\n')[:20]:
+            print(f"  {line}")
+
+    # Check for login modal
+    login_info = eval_js(ws, 12, """
+        (function() {
+            var b = document.body.innerText;
+            return {
+                hasLogin: b.includes('登入') || b.includes('Login') || b.includes('Log in'),
+                hasSignup: b.includes('免費註冊') || b.includes('Sign up'),
+                hasModal: b.includes('尚未登入') || b.includes('Sign in')
+            };
+        })()
+    """)
+    if isinstance(login_info, dict):
+        print(f"\nLogin status: login={login_info.get('hasLogin')} signup={login_info.get('hasSignup')} modal={login_info.get('hasModal')}")
+
+    # Textarea
+    ta = eval_js(ws, 13, """
+        (function() {
+            var ta = document.querySelector('textarea');
+            if (!ta) return null;
+            return {
+                hasValue: !!ta.value,
+                value: ta.value.substring(0,50),
+                placeholder: ta.placeholder || ta.getAttribute('aria-placeholder')
+            };
+        })()
+    """)
+    if ta:
+        print(f"\nText area: hasValue={ta.get('hasValue')} placeholder='{ta.get('placeholder','')}'")
+
+
+def cmd_type(ws, msg):
+    """Type message into ChatGPT textarea without sending.
+    
+    Uses Input.dispatchKeyEvent per character — the ONLY method that works
+    with ChatGPT's React-based textarea.
+    """
+    print(f"Typing: {msg}")
+    _type_char_by_char(ws, msg)
+    time.sleep(0.5)
+
+
+def _type_char_by_char(ws, msg, start_id=100):
+    """Type message using Input.dispatchKeyEvent per character.
+    
+    CRITICAL: ChatGPT (React) does NOT respond to JS textarea.value assignment.
+    Must use Input domain to simulate actual keyboard input character by character.
+    """
+    for i, ch in enumerate(msg):
+        send_cmd(ws, start_id + i, "Input.dispatchKeyEvent", {
+            "type": "char", "text": ch
+        })
+        time.sleep(0.03)
+
+
+def _send_enter(ws):
+    """Send Enter key using Input domain (keyDown/char/keyUp)."""
+    send_cmd(ws, 30, "Input.dispatchKeyEvent",
+             {"type": "keyDown", "key": "Enter", "code": "Enter", "keyCode": 13})
+    send_cmd(ws, 31, "Input.dispatchKeyEvent",
+             {"type": "char", "text": "\n", "key": "Enter", "code": "Enter"})
+    send_cmd(ws, 32, "Input.dispatchKeyEvent",
+             {"type": "keyUp", "key": "Enter", "code": "Enter", "keyCode": 13})
+
+
+def cmd_ask(ws, msg, wait_time=10, timeout=60, screenshot=None):
+    """Type, send, wait for response, and optionally screenshot.
+
+    Automatically detects and closes login modal if present.
+    Uses Input.dispatchKeyEvent per character — the ONLY method that works
+    with ChatGPT's React-based textarea.
+    """
+    # Step 0: Auto-close login modal if present
+    print(f"Checking for login modal...")
+    modal_closed = close_login_modal_auto(ws)
+    if modal_closed:
+        print("  Login modal closed, proceeding with question.\n")
+        time.sleep(1)
+        # Verify textarea is usable
+        ta = eval_js(ws, 100, """
+        (function() {
+            var ta = document.querySelector('textarea');
+            return ta ? {found: true, disabled: ta.disabled, placeholder: (ta.placeholder || ta.getAttribute('aria-placeholder') || '').substring(0, 50)} : {found: false};
+        })()
+        """)
+        if ta and isinstance(ta, dict) and ta.get('found'):
+            print(f"  Textarea OK: placeholder='{ta.get('placeholder','')}'\n")
+        else:
+            print("  ⚠ Textarea not usable, proceeding anyway...\n")
+    else:
+        print("  No login modal — proceeding directly.\n")
+    # Step 1: Type character by character using Input domain
+    print(f"Typing: {msg}")
+    _type_char_by_char(ws, msg)
+    time.sleep(0.5)
+
+    # Step 2: Send via Enter key (Input domain)
+    print("Sending Enter...")
+    _send_enter(ws)
+    drain_events(ws, 10)
+
+    # Step 3: Poll for response
+    print(f"Waiting for response (up to {wait_time}s)...")
+    for i in range(wait_time):
+        time.sleep(1)
+
+        # Check body text length — a response adds significant text
+        body_len = eval_js(ws, 30, "document.body.innerText.length", timeout=5)
+        body_preview = eval_js(ws, 31, "document.body.innerText.substring(0,2000)", timeout=5)
+
+        if body_preview and len(body_preview) > 400:
+            print(f"\n{'='*55}")
+            print(f" Response received ({len(body_preview)} chars):")
+            print(f"{'='*55}")
+            print(body_preview[:1500])
+            if len(body_preview) > 1500:
+                print(f"\n... (truncated, total {len(body_preview)} chars)")
+            break
+    else:
+        if body_preview:
+            print(f"\n⚠ Response may still be loading or limited ({len(body_preview)} chars):")
+            print(body_preview)
+        else:
+            print("\n⚠ No response detected. The unauthenticated session may have reached its limit.")
+            print("   Try: 1) Reload the page and ask again, 2) Log in to ChatGPT for unlimited use.")
+
+    # Step 4: Screenshot if requested
+    if screenshot:
+        take_screenshot(ws, screenshot)
+
+
+def cmd_history(ws, lines=500):
+    """Get current page body text."""
+    body = eval_js(ws, 10, f"document.body.innerText.split('\\n').slice(0, {lines}).join('\\n')")
+    if body:
+        print(body)
+    else:
+        print("No content.")
+
+
+def take_screenshot(ws, outfile, timeout=10):
+    """Take a screenshot and save to file."""
+    send_cmd(ws, 40, "Page.captureScreenshot", {"format": "jpeg", "quality": 85})
+    result = recv_result(ws, 40, timeout=timeout)
+    if result and "data" in result:
+        img = base64.b64decode(result["data"])
+        with open(outfile, "wb") as f:
+            f.write(img)
+        print(f"✓ Screenshot saved: {outfile} ({len(img):,d} bytes)")
+    else:
+        print(f"✗ Screenshot failed: {str(result)[:200]}")
+
+
+def cmd_screenshot(ws, outfile):
+    take_screenshot(ws, outfile)
+
+
+def cmd_html(ws, outfile):
+    """Save full page HTML."""
+    send_cmd(ws, 60, "DOM.getDocument", {"depth": 0})
+    doc = recv_result(ws, 60, timeout=5)
+    if not doc:
+        print("✗ DOM.getDocument failed")
+        return
+    root_id = doc.get("root", {}).get("nodeId")
+    if not root_id:
+        print("✗ No root node found")
+        return
+    send_cmd(ws, 61, "DOM.getOuterHTML", {"nodeId": root_id})
+    outer = recv_result(ws, 61, timeout=5)
+    if outer and "outerHTML" in outer:
+        with open(outfile, "w", encoding="utf-8") as f:
+            f.write(outer["outerHTML"])
+        print(f"✓ HTML saved: {outfile} ({len(outer['outerHTML']):,d} chars)")
+
+
+def cmd_close_modal(ws, tab):
+    """Show instructions for user to manually close the login modal."""
+    print("=" * 55)
+    print("  請手動關閉 ChatGPT 登入彈窗")
+    print("=" * 55)
+    print()
+    print("  1. 切換到 Chrome 瀏覽器 (port 9222 的那個視窗)")
+    print("  2. 如果看到「尚未登入」彈窗（有登入 / 免費註冊按鈕）")
+    print("  3. 點擊彈窗右上角的 X 關閉它")
+    print("  4. 頁面會回到 ChatGPT 主畫面（有輸入框）")
+    print()
+    print("  關閉後，重新執行本工具即可開始對話。")
+    print()
+
+    ready = eval_js(ws, 10, "document.readyState")
+    body = eval_js(ws, 11, "document.body.innerText.substring(0,300)")
+    if body:
+        print("  目前頁面內容：")
+        for line in body.strip().split('\n')[:8]:
+            print(f"    {line}")
+    print()
+    print("  成功標誌：頁面顯示「隨時準備好就可以開始了。」+ 輸入框")
+    print("  失敗標誌：仍顯示「登入 / 免費註冊」彈窗")
+
+
+def cmd_goto(ws, tab, url):
+    """Navigate to URL."""
+    send_cmd(ws, 10, "Runtime.evaluate", {
+        "expression": f"location.href = '{url}'",
+        "awaitPromise": True,
+        "returnByValue": True
+    })
+    resp = recv_result(ws, 10, 15)
+    print(f"Navigate: {resp}")
+    print("Waiting for load...")
+    for i in range(25):
+        time.sleep(2)
+        resp = eval_js(ws, 20 + i, "({ready: document.readyState, url: location.href.substring(0,60)})")
+        if resp and 'complete' in str(resp):
+            print(f"  ✓ Loaded after {i*2}s")
+            break
+    else:
+        print("  ⚠ May not be fully loaded, continuing anyway")
+
+
+def cmd_tabs():
+    """List all Chrome tabs."""
+    tabs = get_tabs()
+    for i, t in enumerate(tabs):
+        title = t.get('title', 'N/A')[:60]
+        url = t.get('url', 'N/A')[:100]
+        tag = " [ChatGPT]" if 'chatgpt' in t.get('url', '').lower() else ""
+        print(f"[{i}] {title}{tag}")
+        print(f"    ID: {t['id']}")
+        print(f"    URL: {url}")
+
+
+def cmd_eval(ws, code):
+    """Evaluate arbitrary JavaScript."""
+    result = eval_js(ws, 10, code, timeout=10)
+    if result is not None:
+        print(result)
+    else:
+        print("No result.")
+
+
+# ─── CLI Entry Point ────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="ChatGPT 未登入模式 CDP 自動化",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python3 chatgpt_cdp.py status
+  python3 chatgpt_cdp.py type "你好"
+  python3 chatgpt_cdp.py ask "自我介紹"
+  python3 chatgpt_cdp.py ask "Write bubble sort in Python" --screenshot /tmp/sort.jpg
+  python3 chatgpt_cdp.py history
+  python3 chatgpt_cdp.py close-modal
+  python3 chatgpt_cdp.py screenshot /tmp/page.jpg
+  python3 chatgpt_cdp.py tabs
+        """
+    )
+    parser.add_argument("command", nargs="?", default="help",
+                        help="Command: status, type, ask, history, close-modal, tabs, goto, eval, screenshot, html")
+    parser.add_argument("args", nargs="*", help="Arguments")
+    parser.add_argument("--wait", type=int, default=10,
+                        help="Seconds to wait for response (default: 10)")
+    parser.add_argument("--timeout", type=int, default=60,
+                        help="CDP response timeout in seconds (default: 60)")
+    parser.add_argument("--drain", type=int, default=50,
+                        help="Events to drain on connect (default: 50)")
+    parser.add_argument("--port", type=int, default=9222,
+                        help="Chrome CDP port (default: 9222)")
+
+    # Override globals
+    args, extra = parser.parse_known_args()
+    global PORT, BASE
+    PORT = args.port
+    BASE = f"http://127.0.0.1:{PORT}"
+
+    cmd = args.command
+
+    if cmd == "tabs":
+        cmd_tabs()
+        return
+
+    if cmd == "help":
+        print(parser.format_help())
+        return
+
+    ws, tab, drained = connect(drain=args.drain)
+    try:
+        if cmd == "status":
+            cmd_status(ws, tab)
+        elif cmd == "type":
+            if not args.args:
+                print("Usage: chatgpt_cdp.py type <msg>", file=sys.stderr)
+                sys.exit(1)
+            msg = " ".join(args.args)
+            cmd_type(ws, msg)
+        elif cmd == "ask":
+            if not args.args:
+                print("Usage: chatgpt_cdp.py ask <msg>", file=sys.stderr)
+                sys.exit(1)
+            msg = " ".join(args.args)
+            screenshot_file = None
+            for i, a in enumerate(extra):
+                if a == "--screenshot" and i + 1 < len(extra):
+                    screenshot_file = extra[i + 1]
+            cmd_ask(ws, msg, wait_time=args.wait, timeout=args.timeout,
+                    screenshot=screenshot_file)
+        elif cmd == "history":
+            lines = int(args.args[0]) if args.args else 500
+            cmd_history(ws, lines)
+        elif cmd == "close-modal":
+            cmd_close_modal(ws, tab)
+        elif cmd == "screenshot":
+            out = args.args[0] if args.args else "/tmp/chatgpt_screenshot.jpg"
+            cmd_screenshot(ws, out)
+        elif cmd == "html":
+            out = args.args[0] if args.args else "/tmp/chatgpt_page.html"
+            cmd_html(ws, out)
+        elif cmd == "goto":
+            if not args.args:
+                print("Usage: chatgpt_cdp.py goto <url>", file=sys.stderr)
+                sys.exit(1)
+            cmd_goto(ws, tab, args.args[0])
+        elif cmd == "eval":
+            if not args.args:
+                print("Usage: chatgpt_cdp.py eval <js_code>", file=sys.stderr)
+                sys.exit(1)
+            cmd_eval(ws, " ".join(args.args))
+        else:
+            print(f"Unknown command: {cmd}")
+            print("Try: python3 chatgpt_cdp.py help")
+    finally:
+        ws.close()
+
+
+if __name__ == "__main__":
+    main()
