@@ -319,16 +319,18 @@ def _handle_nonstreaming(message, request):
 def _load_webui_files():
     """Load web UI files if available."""
     if not os.path.exists(WEBUI_DIR):
-        return None, None, None, None
+        return None, None, None, None, None
 
     try:
         index_html = open(os.path.join(WEBUI_DIR, "index.html"), "rb").read()
+        app_js = open(os.path.join(WEBUI_DIR, "app.js"), "rb").read()
+        style_css = open(os.path.join(WEBUI_DIR, "style.css"), "rb").read()
         bundle_js = open(os.path.join(WEBUI_DIR, "bundle.js"), "rb").read()
         bundle_css = open(os.path.join(WEBUI_DIR, "bundle.css"), "rb").read()
         loading_html = open(os.path.join(WEBUI_DIR, "loading.html"), "rb").read()
-        return index_html, bundle_js, bundle_css, loading_html
+        return index_html, app_js, style_css, bundle_js, bundle_css, loading_html
     except Exception:
-        return None, None, None, None
+        return None, None, None, None, None, None
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -358,10 +360,28 @@ async def web_ui_index_html():
     return Response(status_code=503)
 
 
+@app.get("/app.js")
+async def web_ui_app_js():
+    """Serve app.js (custom frontend for ChatGPT-CDP)."""
+    _, app_js, _, _, _, _ = _load_webui_files()
+    if app_js:
+        return Response(content=app_js, media_type="application/javascript; charset=utf-8")
+    return Response(status_code=503)
+
+
+@app.get("/style.css")
+async def web_ui_style_css():
+    """Serve style.css."""
+    _, _, style_css, _, _, _ = _load_webui_files()
+    if style_css:
+        return Response(content=style_css, media_type="text/css; charset=utf-8")
+    return Response(status_code=503)
+
+
 @app.get("/bundle.js")
 async def web_ui_bundle_js():
-    """Serve bundle.js (compiled Svelte frontend)."""
-    _, bundle_js, _, _ = _load_webui_files()
+    """Serve bundle.js (compiled Svelte frontend, fallback)."""
+    _, _, _, bundle_js, _, _ = _load_webui_files()
     if bundle_js:
         return Response(content=bundle_js, media_type="application/javascript; charset=utf-8")
     return Response(status_code=503)
@@ -369,8 +389,8 @@ async def web_ui_bundle_js():
 
 @app.get("/bundle.css")
 async def web_ui_bundle_css():
-    """Serve bundle.css."""
-    _, _, bundle_css, _ = _load_webui_files()
+    """Serve bundle.css (fallback)."""
+    _, _, _, _, bundle_css, _ = _load_webui_files()
     if bundle_css:
         return Response(content=bundle_css, media_type="text/css; charset=utf-8")
     return Response(status_code=503)
