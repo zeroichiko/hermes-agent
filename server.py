@@ -211,7 +211,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
     if request.stream:
         return _handle_streaming(message, request)
     else:
-        return _handle_nonstreaming(message, request)
+        return await _handle_nonstreaming(message, request)
 
 
 def _handle_streaming(message, request):
@@ -283,14 +283,13 @@ def _handle_streaming(message, request):
     )
 
 
-def _handle_nonstreaming(message, request):
+async def _handle_nonstreaming(message, request):
     """Handle non-streaming response based on backend mode."""
-    loop = asyncio.get_event_loop()
     try:
         if CDP_BACKEND == "direct":
-            full_text = loop.run_in_executor(None, _ask_direct, message, CHECK_INTERVAL, MAX_WAIT)
+            full_text = await asyncio.to_thread(_ask_direct, message, CHECK_INTERVAL, MAX_WAIT)
         else:
-            full_text = loop.run_in_executor(None, _ask_via_script, message, CHECK_INTERVAL, MAX_WAIT)
+            full_text = await asyncio.to_thread(_ask_via_script, message, CHECK_INTERVAL, MAX_WAIT)
     except Exception as e:
         log.error(f"CDP error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
