@@ -22,19 +22,29 @@ def main():
     parser.add_argument("message", help="Message to send")
     parser.add_argument("--check", type=int, default=2, help="Check interval (seconds)")
     parser.add_argument("--wait", type=int, default=120, help="Max wait (seconds)")
+    parser.add_argument("--stream", action="store_true", help="Enable streaming output")
     args = parser.parse_args()
 
     cdp = ChatGPTCDP(port=9222, drain=30)
     try:
-        response = cdp.ask(
-            message=args.message,
-            check_interval=args.check,
-            max_wait=args.wait,
-            start_new=True,
-            strip_html=True,
-            max_output_len=5000,
-        )
-        print(response, end="")
+        if args.stream:
+            # Streaming mode: print each chunk as it arrives
+            for chunk in cdp.ask_streaming(
+                message=args.message,
+                check_interval=args.check,
+                max_wait=args.wait,
+                start_new=True,
+            ):
+                print(chunk, end="", flush=True)
+        else:
+            # Non-streaming mode: wait for full response
+            response = cdp.ask(
+                message=args.message,
+                check_interval=args.check,
+                max_wait=args.wait,
+                start_new=True,
+            )
+            print(response, end="")
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
